@@ -1,0 +1,15 @@
+[package]
+name = "blockchair-dl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["rustls-tls", "stream", "http2"], default-features = false }
+indicatif = "0.17"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+bytesize = "1"
+humantime = "2"
+flate2 = "1"
+futures-util = "0.3"
