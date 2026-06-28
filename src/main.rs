@@ -150,6 +150,7 @@ async fn stream_chunk_to_file(
     retries: usize,
     state: &DownloadState,
     require_206: bool,
+    truncate: bool,
 ) -> Result<()> {
     let range_header = format!("bytes={}-{}", start_byte, end_byte);
     let expected_len = end_byte - start_byte + 1;
@@ -179,7 +180,7 @@ async fn stream_chunk_to_file(
                 let mut f = OpenOptions::new()
                     .write(true)
                     .create(true)
-                    .truncate(true)
+                    .truncate(truncate)
                     .open(path)
                     .await?;
                 let mut stream = resp.bytes_stream();
@@ -367,6 +368,13 @@ async fn download_file(task: FileTask<'_>) -> Result<()> {
     let output_path = task.output_dir.join(&filename);
     let partial_dir = task.output_dir.join(format!(".{}.parts", filename));
 
+    if task.config.resume
+        && let Ok(meta) = tokio::fs::metadata(&output_path).await
+        && meta.len() == total_size
+    {
+        return Ok(());
+    }
+
     let chunk_count = if supports_range && task.config.connections > 1 {
         let ideal = total_size / task.config.min_chunk_size;
         min(ideal, task.config.connections as u64).max(1) as usize
@@ -403,16 +411,13 @@ async fn download_file(task: FileTask<'_>) -> Result<()> {
             };
             let chunk_path = partial_dir.join(format!("part-{:06}", i));
 
-            if task.config.resume && chunk_path.exists() {
-                let metadata = match tokio::fs::metadata(&chunk_path).await {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                let existing_len = metadata.len();
-                if existing_len == (end - start + 1) {
-                    pb.inc(existing_len);
-                    continue;
-                }
+            if task.config.resume
+                && chunk_path.exists()
+                && let Ok(meta) = tokio::fs::metadata(&chunk_path).await
+                && meta.len() == (end - start + 1)
+            {
+                pb.inc(meta.len());
+                continue;
             }
 
             let client = task.client.clone();
@@ -423,7 +428,7 @@ async fn download_file(task: FileTask<'_>) -> Result<()> {
 
             handles.push(tokio::spawn(async move {
                 stream_chunk_to_file(
-                    &client, &url, start, end, &chunk_path2, retries, &state, true,
+                    &client, &url, start, end, &chunk_path2, retries, &state, true, true,
                 )
                 .await
             }));
@@ -451,7 +456,7 @@ async fn download_file(task: FileTask<'_>) -> Result<()> {
             let state = DownloadState::new(pb.clone());
             stream_chunk_to_file(
                 task.client, task.url, 0, total_size - 1, &output_path,
-                task.config.retries, &state, false,
+                task.config.retries, &state, false, true,
             )
             .await?;
             pb.finish_and_clear();
@@ -474,16 +479,31 @@ async fn download_file(task: FileTask<'_>) -> Result<()> {
         tokio::fs::remove_dir_all(&partial_dir).await?;
         task.mp.remove(&pb);
     } else {
+        let start_byte = if task.config.resume {
+            match tokio::fs::metadata(&output_path).await {
+                Ok(m) => {
+                    let existing = m.len();
+                    if existing > 0 {
+                        pb.inc(existing);
+                    }
+                    existing
+                }
+                Err(_) => 0,
+            }
+        } else {
+            0
+        };
         let state = DownloadState::new(pb.clone());
         stream_chunk_to_file(
             task.client,
             task.url,
-            0,
+            start_byte,
             total_size - 1,
             &output_path,
             task.config.retries,
             &state,
             false,
+            start_byte == 0,
         )
         .await?;
         pb.finish_and_clear();
