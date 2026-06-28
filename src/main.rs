@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 #[derive(Parser)]
 #[command(
@@ -19,35 +19,27 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
     about = "Blazing-fast Blockchair data downloader with parallel chunking & resume"
 )]
 struct Args {
-    /// URL(s) to download (or paths to .txt files containing URLs)
     #[arg(required = true)]
     sources: Vec<String>,
 
-    /// Output directory (default: current dir)
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Number of parallel connections per file
     #[arg(short, long, default_value = "8")]
     connections: usize,
 
-    /// Minimum chunk size in bytes (e.g. 10MB, 1GB)
     #[arg(long, default_value = "10MB")]
     min_chunk_size: String,
 
-    /// Max retries per chunk
     #[arg(long, default_value = "5")]
     retries: usize,
 
-    /// Decompress .gz files after download (removes .gz extension)
     #[arg(short, long)]
     decompress: bool,
 
-    /// Resume partial downloads (checks for existing files)
     #[arg(long)]
     resume: bool,
 
-    /// Override filename (only valid with single URL)
     #[arg(short, long)]
     filename: Option<String>,
 }
@@ -125,14 +117,15 @@ fn build_client() -> Result<reqwest::Client> {
     Ok(client)
 }
 
-async fn download_chunk(
+async fn stream_chunk_to_file(
     client: &reqwest::Client,
     url: &str,
     start_byte: u64,
     end_byte: u64,
+    path: &Path,
     retries: usize,
     state: &DownloadState,
-) -> Result<Vec<u8>> {
+) -> Result<()> {
     let range_header = format!("bytes={}-{}", start_byte, end_byte);
     let mut last_err = None;
 
@@ -142,26 +135,32 @@ async fn download_chunk(
             tokio::time::sleep(delay).await;
         }
 
-        let mut headers = HeaderMap::new();
-        headers.insert(RANGE, HeaderValue::from_str(&range_header)?);
+        let mut req_headers = HeaderMap::new();
+        req_headers.insert(RANGE, HeaderValue::from_str(&range_header)?);
 
-        match client.get(url).headers(headers).send().await {
+        match client.get(url).headers(req_headers).send().await {
             Ok(resp) => {
                 if !resp.status().is_success() && resp.status().as_u16() != 206 {
                     last_err = Some(anyhow::anyhow!("HTTP {}", resp.status()));
                     continue;
                 }
-                let mut buf = Vec::with_capacity((end_byte - start_byte + 1) as usize);
+                let mut f = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(path)
+                    .await?;
                 let mut stream = resp.bytes_stream();
                 use futures_util::StreamExt;
                 while let Some(chunk) = stream.next().await {
                     let chunk = chunk?;
+                    f.write_all(&chunk).await?;
                     state
                         .bytes_downloaded
                         .fetch_add(chunk.len() as u64, Ordering::Relaxed);
-                    buf.extend_from_slice(&chunk);
                 }
-                return Ok(buf);
+                f.flush().await?;
+                return Ok(());
             }
             Err(e) => {
                 last_err = Some(anyhow::anyhow!(e));
@@ -171,11 +170,7 @@ async fn download_chunk(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Download failed after {} retries", retries)))
 }
 
-async fn concatenate_chunks(
-    output_path: &Path,
-    chunk_files: &[PathBuf],
-    _total_size: u64,
-) -> Result<()> {
+async fn concatenate_chunks(output_path: &Path, chunk_files: &[PathBuf]) -> Result<()> {
     let mut out = OpenOptions::new()
         .write(true)
         .create(true)
@@ -183,12 +178,16 @@ async fn concatenate_chunks(
         .open(output_path)
         .await?;
 
+    let mut buf = vec![0u8; 1_048_576];
     for cf in chunk_files {
         let mut f = File::open(cf).await?;
-        let mut buf = Vec::with_capacity(1_048_576);
-        let n = f.read_to_end(&mut buf).await?;
-        if n > 0 {
-            out.write_all(&buf).await?;
+        loop {
+            use tokio::io::AsyncReadExt;
+            let n = f.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n]).await?;
         }
     }
     out.flush().await?;
@@ -318,16 +317,10 @@ async fn download_file(task: FileTask<'_>) -> Result<()> {
             let retries = task.config.retries;
 
             handles.push(tokio::spawn(async move {
-                let data = download_chunk(&client, &url, start, end, retries, &state).await?;
-                let mut f = OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&chunk_path2)
-                    .await?;
-                f.write_all(&data).await?;
-                f.flush().await?;
-                Ok::<_, anyhow::Error>(())
+                stream_chunk_to_file(
+                    &client, &url, start, end, &chunk_path2, retries, &state,
+                )
+                .await
             }));
         }
 
@@ -342,29 +335,21 @@ async fn download_file(task: FileTask<'_>) -> Result<()> {
             .collect();
         chunk_files.sort();
 
-        concatenate_chunks(&output_path, &chunk_files, total_size).await?;
+        concatenate_chunks(&output_path, &chunk_files).await?;
 
         tokio::fs::remove_dir_all(&partial_dir).await?;
     } else {
-        let data = download_chunk(
+        stream_chunk_to_file(
             task.client,
             task.url,
             0,
             total_size - 1,
+            &output_path,
             task.config.retries,
             &state,
         )
         .await?;
         pb.finish_and_clear();
-
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&output_path)
-            .await?;
-        f.write_all(&data).await?;
-        f.flush().await?;
     }
 
     task.mp.remove(&pb);
