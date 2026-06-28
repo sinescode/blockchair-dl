@@ -3,7 +3,7 @@ use bytesize::ByteSize;
 use clap::Parser;
 use futures_util::StreamExt;
 use indicatif::{HumanDuration, MultiProgress, ProgressBar, ProgressStyle};
-use reqwest::header::{ACCEPT_ENCODING, HeaderMap, HeaderValue, RANGE};
+use reqwest::header::{HeaderMap, HeaderValue, RANGE};
 use std::cmp::min;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -131,7 +131,6 @@ fn build_client() -> Result<reqwest::Client> {
         "User-Agent",
         HeaderValue::from_static("Mozilla/5.0 (X11; Linux x86_64) blockchair-dl/0.1"),
     );
-    headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
     let client = reqwest::Client::builder()
         .default_headers(headers)
         .no_deflate()
@@ -187,7 +186,9 @@ async fn stream_chunk_to_file(
                 let mut stream = resp.bytes_stream();
                 let mut received: u64 = 0;
                 while let Some(chunk) = stream.next().await {
-                    let chunk = chunk?;
+                    let chunk = chunk.with_context(|| {
+                        format!("Failed to read response body for range {}-{}", start_byte, end_byte)
+                    })?;
                     f.write_all(&chunk).await?;
                     let len = chunk.len() as u64;
                     received += len;
@@ -392,7 +393,6 @@ async fn download_file(task: FileTask<'_>) -> Result<()> {
 
     if supports_range && chunk_count > 1 {
         tokio::fs::create_dir_all(&partial_dir).await?;
-        let use_range = true;
 
         let mut handles = Vec::new();
         for i in 0..chunk_count {
@@ -424,14 +424,7 @@ async fn download_file(task: FileTask<'_>) -> Result<()> {
 
             handles.push(tokio::spawn(async move {
                 stream_chunk_to_file(
-                    &client,
-                    &url,
-                    start,
-                    end,
-                    &chunk_path2,
-                    retries,
-                    &state,
-                    use_range,
+                    &client, &url, start, end, &chunk_path2, retries, &state, true,
                 )
                 .await
             }));
@@ -443,13 +436,28 @@ async fn download_file(task: FileTask<'_>) -> Result<()> {
                 Err(e) => Err(anyhow::anyhow!("Task panicked: {}", e)),
             }).collect();
 
+        let mut failed = false;
         for r in &results {
             if let Err(e) = r {
-                pb.finish_and_clear();
-                task.mp.remove(&pb);
-                let _ = tokio::fs::remove_dir_all(&partial_dir).await;
-                return Err(anyhow::anyhow!("Chunk download failed: {}", e));
+                failed = true;
+                eprintln!("Chunk download failed ({}), falling back to single connection", e);
+                break;
             }
+        }
+
+        if failed {
+            let _ = tokio::fs::remove_dir_all(&partial_dir).await;
+            pb.reset();
+            pb.set_length(total_size);
+            let state = DownloadState::new(pb.clone());
+            stream_chunk_to_file(
+                task.client, task.url, 0, total_size - 1, &output_path,
+                task.config.retries, &state, false,
+            )
+            .await?;
+            pb.finish_and_clear();
+            task.mp.remove(&pb);
+            return Ok(());
         }
 
         pb.finish_and_clear();
@@ -465,8 +473,8 @@ async fn download_file(task: FileTask<'_>) -> Result<()> {
         }
 
         tokio::fs::remove_dir_all(&partial_dir).await?;
+        task.mp.remove(&pb);
     } else {
-        let use_range = false;
         let state = DownloadState::new(pb.clone());
         stream_chunk_to_file(
             task.client,
@@ -476,13 +484,12 @@ async fn download_file(task: FileTask<'_>) -> Result<()> {
             &output_path,
             task.config.retries,
             &state,
-            use_range,
+            false,
         )
         .await?;
         pb.finish_and_clear();
+        task.mp.remove(&pb);
     }
-
-    task.mp.remove(&pb);
 
     if task.config.decompress && filename.ends_with(".gz") {
         let decompressed_path = output_path.with_extension("");
