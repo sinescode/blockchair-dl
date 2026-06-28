@@ -135,7 +135,6 @@ fn build_client() -> Result<reqwest::Client> {
         .default_headers(headers)
         .no_deflate()
         .tcp_keepalive(Some(Duration::from_secs(30)))
-        .timeout(Duration::from_secs(300))
         .connect_timeout(Duration::from_secs(30))
         .build()?;
     Ok(client)
