@@ -95,6 +95,7 @@ dependencies = [
  "indicatif",
  "reqwest",
  "tokio",
+ "url",
 ]
 
 [[package]]

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use bytesize::ByteSize;
 use clap::Parser;
+use futures_util::StreamExt;
 use indicatif::{HumanDuration, MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::header::{ACCEPT_ENCODING, HeaderMap, HeaderValue, RANGE};
 use std::cmp::min;
@@ -10,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::fs::{File, OpenOptions};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Parser)]
 #[command(
@@ -55,13 +56,20 @@ struct DownloadConfig {
 
 struct DownloadState {
     bytes_downloaded: Arc<AtomicU64>,
+    progress: ProgressBar,
 }
 
 impl DownloadState {
-    fn new() -> Self {
+    fn new(progress: ProgressBar) -> Self {
         Self {
             bytes_downloaded: Arc::new(AtomicU64::new(0)),
+            progress,
         }
+    }
+
+    fn add(&self, n: u64) {
+        self.bytes_downloaded.fetch_add(n, Ordering::Relaxed);
+        self.progress.inc(n);
     }
 }
 
@@ -82,23 +90,39 @@ fn parse_size(s: &str) -> Result<u64> {
     Ok((num * unit as f64) as u64)
 }
 
-async fn head_request(client: &reqwest::Client, url: &str) -> Result<(u64, bool)> {
-    let resp = client.head(url).send().await?;
-    if !resp.status().is_success() {
-        bail!("HEAD {} returned {}", url, resp.status());
+async fn head_request(client: &reqwest::Client, url: &str, retries: usize) -> Result<(u64, bool)> {
+    let mut last_err = None;
+    for attempt in 0..=retries {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_secs(2u64.pow(attempt as u32))).await;
+        }
+        match client.head(url).send().await {
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    last_err = Some(anyhow::anyhow!("HEAD {} returned {}", url, resp.status()));
+                    continue;
+                }
+                let headers = resp.headers();
+                let length = headers
+                    .get(reqwest::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok());
+                let accepts_range = headers
+                    .get("accept-ranges")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v.contains("bytes"))
+                    .unwrap_or(false);
+                if let Some(len) = length {
+                    return Ok((len, accepts_range));
+                }
+                last_err = Some(anyhow::anyhow!("HEAD {} missing Content-Length", url));
+            }
+            Err(e) => {
+                last_err = Some(anyhow::anyhow!("HEAD {} failed: {}", url, e));
+            }
+        }
     }
-    let headers = resp.headers();
-    let length = headers
-        .get(reqwest::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-        .context("Missing Content-Length")?;
-    let accepts_range = headers
-        .get("accept-ranges")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.contains("bytes"))
-        .unwrap_or(false);
-    Ok((length, accepts_range))
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("HEAD failed after {} retries", retries)))
 }
 
 fn build_client() -> Result<reqwest::Client> {
@@ -110,6 +134,7 @@ fn build_client() -> Result<reqwest::Client> {
     headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
     let client = reqwest::Client::builder()
         .default_headers(headers)
+        .no_deflate()
         .tcp_keepalive(Some(Duration::from_secs(30)))
         .timeout(Duration::from_secs(300))
         .connect_timeout(Duration::from_secs(30))
@@ -117,6 +142,7 @@ fn build_client() -> Result<reqwest::Client> {
     Ok(client)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_chunk_to_file(
     client: &reqwest::Client,
     url: &str,
@@ -125,8 +151,10 @@ async fn stream_chunk_to_file(
     path: &Path,
     retries: usize,
     state: &DownloadState,
+    require_206: bool,
 ) -> Result<()> {
     let range_header = format!("bytes={}-{}", start_byte, end_byte);
+    let expected_len = end_byte - start_byte + 1;
     let mut last_err = None;
 
     for attempt in 0..=retries {
@@ -140,8 +168,14 @@ async fn stream_chunk_to_file(
 
         match client.get(url).headers(req_headers).send().await {
             Ok(resp) => {
-                if !resp.status().is_success() && resp.status().as_u16() != 206 {
-                    last_err = Some(anyhow::anyhow!("HTTP {}", resp.status()));
+                let status = resp.status().as_u16();
+                if require_206 && status != 206 {
+                    last_err =
+                        Some(anyhow::anyhow!("HTTP {} (expected 206 Partial Content)", status));
+                    continue;
+                }
+                if !resp.status().is_success() {
+                    last_err = Some(anyhow::anyhow!("HTTP {}", status));
                     continue;
                 }
                 let mut f = OpenOptions::new()
@@ -151,15 +185,25 @@ async fn stream_chunk_to_file(
                     .open(path)
                     .await?;
                 let mut stream = resp.bytes_stream();
-                use futures_util::StreamExt;
+                let mut received: u64 = 0;
                 while let Some(chunk) = stream.next().await {
                     let chunk = chunk?;
                     f.write_all(&chunk).await?;
-                    state
-                        .bytes_downloaded
-                        .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                    let len = chunk.len() as u64;
+                    received += len;
+                    state.add(len);
+                }
+                if received != expected_len {
+                    bail!(
+                        "Expected {} bytes for range {}-{}, got {}",
+                        expected_len,
+                        start_byte,
+                        end_byte,
+                        received
+                    );
                 }
                 f.flush().await?;
+                f.sync_all().await?;
                 return Ok(());
             }
             Err(e) => {
@@ -182,7 +226,6 @@ async fn concatenate_chunks(output_path: &Path, chunk_files: &[PathBuf]) -> Resu
     for cf in chunk_files {
         let mut f = File::open(cf).await?;
         loop {
-            use tokio::io::AsyncReadExt;
             let n = f.read(&mut buf).await?;
             if n == 0 {
                 break;
@@ -191,6 +234,7 @@ async fn concatenate_chunks(output_path: &Path, chunk_files: &[PathBuf]) -> Resu
         }
     }
     out.flush().await?;
+    out.sync_all().await?;
     Ok(())
 }
 
@@ -213,7 +257,8 @@ fn decompress_gz(input: &Path, output: &Path) -> Result<()> {
 fn expand_sources(sources: &[String]) -> Result<Vec<String>> {
     let mut urls = Vec::new();
     for src in sources {
-        if src.starts_with("http://") || src.starts_with("https://") {
+        let lower = src.to_lowercase();
+        if lower.starts_with("http://") || lower.starts_with("https://") {
             urls.push(src.clone());
         } else {
             let content = std::fs::read_to_string(src)
@@ -230,13 +275,21 @@ fn expand_sources(sources: &[String]) -> Result<Vec<String>> {
 }
 
 fn url_filename(url: &str) -> String {
-    url.rsplit('/')
-        .next()
-        .unwrap_or("download")
-        .split('?')
-        .next()
-        .unwrap_or("download")
-        .to_string()
+    if let Ok(parsed) = url::Url::parse(url) {
+        parsed
+            .path_segments()
+            .and_then(|mut s| s.next_back())
+            .unwrap_or("download")
+            .to_string()
+    } else {
+        url.rsplit('/')
+            .next()
+            .unwrap_or("download")
+            .split('?')
+            .next()
+            .unwrap_or("download")
+            .to_string()
+    }
 }
 
 struct FileTask<'a> {
@@ -251,7 +304,61 @@ struct FileTask<'a> {
 }
 
 async fn download_file(task: FileTask<'_>) -> Result<()> {
-    let (total_size, supports_range) = head_request(task.client, task.url).await?;
+    let (total_size, supports_range) =
+        match head_request(task.client, task.url, task.config.retries).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("HEAD failed ({}), falling back to single-connection download", e);
+                let resp = task.client.get(task.url).send().await?;
+                let total_size = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .context("No Content-Length in GET response")?;
+                let filename = task
+                    .override_filename
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| url_filename(task.url));
+                let output_path = task.output_dir.join(&filename);
+                let pb = task.mp.add(ProgressBar::new(total_size));
+                pb.set_style(
+                    ProgressStyle::default_bar()
+                        .template("{prefix:40.cyan.bold} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+                        .unwrap()
+                        .progress_chars("##-"),
+                );
+                pb.set_prefix(filename.clone());
+                let state = DownloadState::new(pb.clone());
+                let mut f = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&output_path)
+                    .await?;
+                let mut stream = resp.bytes_stream();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk?;
+                    f.write_all(&chunk).await?;
+                    state.add(chunk.len() as u64);
+                }
+                f.flush().await?;
+                f.sync_all().await?;
+                pb.finish_and_clear();
+                task.mp.remove(&pb);
+                return Ok(());
+            }
+        };
+
+    if total_size == 0 {
+        let filename = task
+            .override_filename
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| url_filename(task.url));
+        let output_path = task.output_dir.join(&filename);
+        File::create(&output_path).await?;
+        return Ok(());
+    }
 
     let filename = task
         .override_filename
@@ -283,10 +390,9 @@ async fn download_file(task: FileTask<'_>) -> Result<()> {
     );
     pb.set_prefix(header);
 
-    let state = Arc::new(DownloadState::new());
-
     if supports_range && chunk_count > 1 {
         tokio::fs::create_dir_all(&partial_dir).await?;
+        let use_range = true;
 
         let mut handles = Vec::new();
         for i in 0..chunk_count {
@@ -299,12 +405,12 @@ async fn download_file(task: FileTask<'_>) -> Result<()> {
             let chunk_path = partial_dir.join(format!("part-{:06}", i));
 
             if task.config.resume && chunk_path.exists() {
-                let metadata = tokio::fs::metadata(&chunk_path).await?;
+                let metadata = match tokio::fs::metadata(&chunk_path).await {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
                 let existing_len = metadata.len();
                 if existing_len == (end - start + 1) {
-                    state
-                        .bytes_downloaded
-                        .fetch_add(existing_len, Ordering::Relaxed);
                     pb.inc(existing_len);
                     continue;
                 }
@@ -312,20 +418,38 @@ async fn download_file(task: FileTask<'_>) -> Result<()> {
 
             let client = task.client.clone();
             let url = task.url.to_string();
-            let state = state.clone();
             let chunk_path2 = chunk_path.clone();
             let retries = task.config.retries;
+            let state = DownloadState::new(pb.clone());
 
             handles.push(tokio::spawn(async move {
                 stream_chunk_to_file(
-                    &client, &url, start, end, &chunk_path2, retries, &state,
+                    &client,
+                    &url,
+                    start,
+                    end,
+                    &chunk_path2,
+                    retries,
+                    &state,
+                    use_range,
                 )
                 .await
             }));
         }
 
-        for handle in handles {
-            handle.await??;
+        let results: Vec<Result<()>> =
+            futures_util::future::join_all(handles).await.into_iter().map(|r| match r {
+                Ok(inner) => inner,
+                Err(e) => Err(anyhow::anyhow!("Task panicked: {}", e)),
+            }).collect();
+
+        for r in &results {
+            if let Err(e) = r {
+                pb.finish_and_clear();
+                task.mp.remove(&pb);
+                let _ = tokio::fs::remove_dir_all(&partial_dir).await;
+                return Err(anyhow::anyhow!("Chunk download failed: {}", e));
+            }
         }
 
         pb.finish_and_clear();
@@ -335,10 +459,15 @@ async fn download_file(task: FileTask<'_>) -> Result<()> {
             .collect();
         chunk_files.sort();
 
-        concatenate_chunks(&output_path, &chunk_files).await?;
+        if let Err(e) = concatenate_chunks(&output_path, &chunk_files).await {
+            let _ = tokio::fs::remove_dir_all(&partial_dir).await;
+            return Err(e);
+        }
 
         tokio::fs::remove_dir_all(&partial_dir).await?;
     } else {
+        let use_range = false;
+        let state = DownloadState::new(pb.clone());
         stream_chunk_to_file(
             task.client,
             task.url,
@@ -347,6 +476,7 @@ async fn download_file(task: FileTask<'_>) -> Result<()> {
             &output_path,
             task.config.retries,
             &state,
+            use_range,
         )
         .await?;
         pb.finish_and_clear();
@@ -365,19 +495,37 @@ async fn download_file(task: FileTask<'_>) -> Result<()> {
         );
         decomp_pb.set_prefix(format!("Decompressing {}", filename));
 
-        decompress_gz(&output_path, &decompressed_path)?;
+        let input = output_path.clone();
+        let output = decompressed_path.clone();
+        let result = tokio::task::spawn_blocking(move || decompress_gz(&input, &output)).await;
 
-        tokio::fs::remove_file(&output_path).await?;
-        decomp_pb.finish_with_message(format!(
-            "Decompressed {} -> {} in {}",
-            ByteSize::b(total_size),
-            ByteSize::b(
-                std::fs::metadata(&decompressed_path)
-                    .map(|m| m.len())
-                    .unwrap_or(0)
-            ),
-            HumanDuration(start.elapsed())
-        ));
+        match result {
+            Ok(Ok(())) => {
+                tokio::fs::remove_file(&output_path).await?;
+                decomp_pb.finish_with_message(format!(
+                    "Decompressed {} -> {} in {}",
+                    ByteSize::b(total_size),
+                    ByteSize::b(
+                        std::fs::metadata(&decompressed_path)
+                            .map(|m| m.len())
+                            .unwrap_or(0)
+                    ),
+                    HumanDuration(start.elapsed())
+                ));
+            }
+            Ok(Err(e)) => {
+                let _ = tokio::fs::remove_file(&decompressed_path).await;
+                decomp_pb.finish_with_message("Decompression failed");
+                task.mp.remove(&decomp_pb);
+                return Err(e);
+            }
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&decompressed_path).await;
+                decomp_pb.finish_with_message("Decompression panicked");
+                task.mp.remove(&decomp_pb);
+                return Err(anyhow::anyhow!("Decompression task failed: {}", e));
+            }
+        }
         task.mp.remove(&decomp_pb);
     }
 
