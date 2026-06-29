@@ -60,3 +60,13 @@ cp target/release/blockchair-dl ~/.local/bin/
 6. Optionally decompresses `.gz` output via `flate2`.
 
 Blockchair's CDN allows many concurrent TCP connections, so `-c 16` typically yields ~160 kB/s when single-curl is throttled to 10 kB/s.
+
+## Hardening (June 2026)
+
+| Area | Issue | Fix |
+|------|-------|-----|
+| `parse_size` return | `f64` → 53‑bit precision loss for files > 900 TB | Changed to `u64` |
+| Request timeout | No timeout → hang on stalled connection | Added 30s `Duration` on `ClientBuilder` |
+| Chunk retry | All chunks retried even if only one failed | Retry only failed chunks |
+| Partial output cleanup | Leftover `.part` files on concatenation error | Clean up partial files on error |
+| Decompression cleanup | `.tsv` left behind if `.gz` concatenation fails | Clean up incomplete `.tsv` on error |

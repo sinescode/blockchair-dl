@@ -86,9 +86,8 @@ fn parse_size(s: &str) -> Result<u64> {
     } else {
         (s.trim(), 1u64)
     };
-    let num: f64 = num_str.parse().context("Invalid size format")?;
-    Ok((num * unit as f64) as u64)
-}
+    let num: u64 = num_str.parse().context("Invalid size format")?;
+    Ok(num.checked_mul(unit).context("Size overflow")?)
 
 async fn head_request(client: &reqwest::Client, url: &str, retries: usize) -> Result<(u64, bool)> {
     let mut last_err = None;
@@ -136,6 +135,7 @@ fn build_client() -> Result<reqwest::Client> {
         .no_deflate()
         .tcp_keepalive(Some(Duration::from_secs(30)))
         .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(3600))
         .build()?;
     Ok(client)
 }
@@ -244,15 +244,21 @@ fn decompress_gz(input: &Path, output: &Path) -> Result<()> {
     let mut decoder = flate2::read::GzDecoder::new(&mut file_in);
     let mut file_out = std::fs::File::create(output)?;
     let mut buf = [0u8; 262144];
-    loop {
-        let n = decoder.read(&mut buf)?;
-        if n == 0 {
-            break;
+    let result = (|| -> Result<()> {
+        loop {
+            let n = decoder.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            file_out.write_all(&buf[..n])?;
         }
-        file_out.write_all(&buf[..n])?;
+        file_out.flush()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(output);
     }
-    file_out.flush()?;
-    Ok(())
+    result
 }
 
 fn expand_sources(sources: &[String]) -> Result<Vec<String>> {
@@ -434,34 +440,60 @@ async fn download_file(task: FileTask<'_>) -> Result<()> {
             }));
         }
 
-        let results: Vec<Result<()>> =
-            futures_util::future::join_all(handles).await.into_iter().map(|r| match r {
-                Ok(inner) => inner,
-                Err(e) => Err(anyhow::anyhow!("Task panicked: {}", e)),
+        let results: Vec<(usize, Result<()>)> =
+            futures_util::future::join_all(handles).await.into_iter().enumerate().map(|(i, r)| match r {
+                Ok(inner) => (i, inner),
+                Err(e) => (i, Err(anyhow::anyhow!("Task panicked: {}", e))),
             }).collect();
 
-        let mut failed = false;
-        for r in &results {
+        let mut retry_handles = Vec::new();
+        let mut any_failed = false;
+        for (i, r) in &results {
             if let Err(e) = r {
-                failed = true;
-                eprintln!("Chunk download failed ({}), falling back to single connection", e);
-                break;
+                any_failed = true;
+                eprintln!("Chunk {} failed: {}, retrying...", i, e);
+                let start = *i as u64 * chunk_size;
+                let end = if *i == chunk_count - 1 {
+                    total_size - 1
+                } else {
+                    (*i as u64 + 1) * chunk_size - 1
+                };
+                let chunk_path = partial_dir.join(format!("part-{:06}", i));
+                let client = task.client.clone();
+                let url = task.url.to_string();
+                let retries = task.config.retries;
+                let state = DownloadState::new(pb.clone());
+                retry_handles.push(tokio::spawn(async move {
+                    stream_chunk_to_file(
+                        &client, &url, start, end, &chunk_path, retries, &state, true, true,
+                    )
+                    .await
+                }));
             }
         }
 
-        if failed {
-            let _ = tokio::fs::remove_dir_all(&partial_dir).await;
-            pb.reset();
-            pb.set_length(total_size);
-            let state = DownloadState::new(pb.clone());
-            stream_chunk_to_file(
-                task.client, task.url, 0, total_size - 1, &output_path,
-                task.config.retries, &state, false, true,
-            )
-            .await?;
-            pb.finish_and_clear();
-            task.mp.remove(&pb);
-            return Ok(());
+        if any_failed {
+            let retry_results: Vec<Result<()>> =
+                futures_util::future::join_all(retry_handles).await.into_iter().map(|r| match r {
+                    Ok(inner) => inner,
+                    Err(e) => Err(anyhow::anyhow!("Retry task panicked: {}", e)),
+                }).collect();
+            for r in &retry_results {
+                if let Err(e) = r {
+                    let _ = tokio::fs::remove_dir_all(&partial_dir).await;
+                    pb.reset();
+                    pb.set_length(total_size);
+                    let state = DownloadState::new(pb.clone());
+                    stream_chunk_to_file(
+                        task.client, task.url, 0, total_size - 1, &output_path,
+                        task.config.retries, &state, false, true,
+                    )
+                    .await?;
+                    pb.finish_and_clear();
+                    task.mp.remove(&pb);
+                    return Ok(());
+                }
+            }
         }
 
         pb.finish_and_clear();
@@ -473,6 +505,7 @@ async fn download_file(task: FileTask<'_>) -> Result<()> {
 
         if let Err(e) = concatenate_chunks(&output_path, &chunk_files).await {
             let _ = tokio::fs::remove_dir_all(&partial_dir).await;
+            let _ = tokio::fs::remove_file(&output_path).await;
             return Err(e);
         }
 
